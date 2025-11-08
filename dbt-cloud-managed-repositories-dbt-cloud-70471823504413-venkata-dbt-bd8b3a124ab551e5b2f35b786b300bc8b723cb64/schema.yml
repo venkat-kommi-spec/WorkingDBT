@@ -1,0 +1,9 @@
+
+version: 2
+
+models:
+  - name: fact_sale
+    columns:
+      - name: order_date
+        data_tests:
+          - not_null
