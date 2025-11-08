@@ -1,108 +1,11 @@
 name: dbt Cloud PR validation (trigger, poll, comment)
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
 permissions:
   contents: read
   pull-requests: write
-
-jobs:
-  trigger_and_monitor_dbt_cloud:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - name: Set up jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Trigger dbt Cloud run
-        id: trigger
-        env:
-          DBT_CLOUD_API_KEY: ${{ secrets.DBT_CLOUD_API_KEY }}
-          DBT_CLOUD_ACCOUNT_ID: ${{ secrets.DBT_CLOUD_ACCOUNT_ID }}
-          DBT_CLOUD_JOB_ID: ${{ secrets.DBT_CLOUD_JOB_ID }}
-        run: |
-          set -euo pipefail
-          PR_NUM=${{ github.event.pull_request.number }}
-          COMMIT_SHA=${{ github.event.pull_request.head.sha }}
-          echo "Triggering dbt Cloud job ${DBT_CLOUD_JOB_ID} for PR #${PR_NUM} commit ${COMMIT_SHA}"
-
-          RESP=$(curl -s -X POST \
-            "https://cloud.getdbt.com/api/v2/accounts/${DBT_CLOUD_ACCOUNT_ID}/jobs/${DBT_CLOUD_JOB_ID}/run/" \
-            -H "Authorization: Bearer ${DBT_CLOUD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"cause":"PR validation","git_sha":"'"${COMMIT_SHA}"'"}')
-
-          echo "Raw response: $RESP"
-          RUN_ID=$(echo "$RESP" | jq -r '.data.id // empty')
-          if [ -z "$RUN_ID" ]; then
-            echo "Failed to create run. Full response:"
-            echo "$RESP"
-            exit 1
-          fi
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
-
-      - name: Poll dbt Cloud run status until finished
-        id: poll
-        env:
-          DBT_CLOUD_API_KEY: ${{ secrets.DBT_CLOUD_API_KEY }}
-          DBT_CLOUD_ACCOUNT_ID: ${{ secrets.DBT_CLOUD_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          RUN_ID=${{ steps.trigger.outputs.run_id }}
-          MAX_ATTEMPTS=${{ secrets.DBT_CLOUD_POLL_MAX || '30' }}
-          INTERVAL=${{ secrets.DBT_CLOUD_POLL_INTERVAL || '10' }}
-          ATTEMPT=0
-
-          echo "Polling dbt Cloud run ${RUN_ID} (max ${MAX_ATTEMPTS} attempts, ${INTERVAL}s interval)"
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            sleep $INTERVAL
-            ATTEMPT=$((ATTEMPT+1))
-            echo "Attempt $ATTEMPT / $MAX_ATTEMPTS"
-
-            R=$(curl -s -H "Authorization: Bearer ${DBT_CLOUD_API_KEY}" \
-              "https://cloud.getdbt.com/api/v2/accounts/${DBT_CLOUD_ACCOUNT_ID}/runs/${RUN_ID}/")
-            STATUS_CODE=$(echo "$R" | jq -r '.data.status // empty')
-            STATUS_LABEL=$(case "$STATUS_CODE" in
-                1) echo "queued" ;;
-                2) echo "running" ;;
-                3) echo "success" ;;
-                4) echo "error" ;;
-                5) echo "cancelled" ;;
-                *) echo "unknown" ;;
-              esac)
-            echo "Status code: $STATUS_CODE ($STATUS_LABEL)"
-
-            if [ "$STATUS_CODE" = "3" ]; then
-              echo "Run succeeded"
-              echo "run_status=success" >> $GITHUB_OUTPUT
-              echo "run_url=https://cloud.getdbt.com/accounts/${DBT_CLOUD_ACCOUNT_ID}/runs/${RUN_ID}/" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-
-            if [ "$STATUS_CODE" = "4" ] || [ "$STATUS_CODE" = "5" ]; then
-              echo "Run failed or cancelled"
-              echo "run_status=failed" >> $GITHUB_OUTPUT
-              echo "run_url=https://cloud.getdbt.com/accounts/${DBT_CLOUD_ACCOUNT_ID}/runs/${RUN_ID}/" >> $GITHUB_OUTPUT
-              exit 1
-            fi
-          done
-
-          echo "Exceeded polling attempts (${MAX_ATTEMPTS}). Marking as failed."
-          echo "run_status=timeout" >> $GITHUB_OUTPUT
-          echo "run_url=https://cloud.getdbt.com/accounts/${DBT_CLOUD_ACCOUNT_ID}/runs/${RUN_ID}/" >> $GITHUB_OUTPUT
-          exit 1
-
-      - name: Post PR comment with run link & status
-        if: always()
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            :robot: dbt Cloud run finished for PR #${{ github.event.pull_request.number }}  
-            **Run link:** ${{ steps.poll.outputs.run_url }}  
-            **Status:** ${{ steps.poll.outputs.run_status }}  
-            (Triggered from commit `${{ github.event.pull_request.head.sha }}`)
